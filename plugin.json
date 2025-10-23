@@ -1,0 +1,21 @@
+{
+  "id": "com.example.imagegen",
+  "name": "ImageGen for Mattermost",
+  "description": "Slash-команды для генерации изображений (GenAPI) с загрузкой в pCloud и квотами.",
+  "version": "0.1.0",
+  "min_server_version": "9.0.0",
+  "server": {
+    "executable": "server/dist/plugin-linux-amd64"
+  },
+  "settings_schema": {
+    "settings": [
+      {
+        "key": "ConfigFilePath",
+        "display_name": "Путь к JSON-файлу настроек",
+        "type": "text",
+        "help_text": "Например: /mattermost/data/imagegen/config.json (смонтируйте volume)",
+        "placeholder": "/mattermost/data/imagegen/config.json"
+      }
+    ]
+  }
+}

@@ -1,0 +1,14 @@
+FROM golang:1.22 as build
+WORKDIR /src
+COPY go.mod ./
+COPY server ./server
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/plugin-linux-amd64 ./server
+
+FROM alpine:3.20
+RUN apk add --no-cache zip
+WORKDIR /bundle
+COPY plugin.json .
+COPY --from=build /out/plugin-linux-amd64 ./server/dist/
+RUN zip -r9 imagegen-plugin.zip ./*

@@ -1,0 +1,21 @@
+{
+  "gen_api_endpoint": "https://api.gen-api.ru/v1/images", 
+  "gen_api_token": "YOUR_GENAPI_TOKEN",
+  "gen_api_model": "gpt-image-1",
+  "pcloud_api_host": "https://api.pcloud.com",
+  "pcloud_token": "YOUR_PCLOUD_TOKEN",
+  "pcloud_folder_id": 123456789,
+  "default_monthly_quota": 30,
+  "next_reset": "2025-11-01T00:00:00Z",
+  "log_path": "/mattermost/data/imagegen/imagegen.log",
+  "users": {
+    "MM_ADMIN_USER_ID": {
+      "username": "admin",
+      "user_id": "MM_ADMIN_USER_ID",
+      "admin": true,
+      "max_per_month": 100,
+      "used_this_period": 0,
+      "bonus_this_period": 0
+    }
+  }
+}
