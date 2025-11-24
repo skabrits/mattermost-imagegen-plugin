@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,10 +15,14 @@ import (
 	"strings"
 	"sync"
 	"time"
-
+	"net/url"
 	"github.com/mattermost/mattermost/server/public/model"
 	"github.com/mattermost/mattermost/server/public/plugin"
 )
+
+type configuration struct {
+    ConfigFilePath string
+}
 
 type Plugin struct {
 	plugin.MattermostPlugin
@@ -33,11 +36,13 @@ type Plugin struct {
 type Config struct {
 	// Провайдер генерации
 	GenAPIEndpoint   string `json:"gen_api_endpoint"`   // например: https://api.gen-api.ru/v1/images/generate  (оставлено настраиваемым)
+	GenAPIGetEndpoint string `json:"gen_api_get_endpoint"`
 	GenAPIToken      string `json:"gen_api_token"`
 	GenAPIModel      string `json:"gen_api_model"`      // "gpt-image-1"
 	// pCloud
 	PCloudAPIHost    string `json:"pcloud_api_host"`    // "https://api.pcloud.com"
-	PCloudToken      string `json:"pcloud_token"`
+	PCloudUsername string `json:"pcloud_user"`
+	PCloudPassword string `json:"pcloud_password"`
 	PCloudFolderID   int64  `json:"pcloud_folder_id"`   // куда грузим изображения
 	// Квоты/лог
 	DefaultMonthlyQuota int       `json:"default_monthly_quota"`
@@ -62,19 +67,25 @@ func (u *User) Remaining() int {
 	return u.MaxPerMonth + u.BonusThisPeriod - u.UsedThisPeriod
 }
 
+func (p *Plugin) OnConfigurationChange() error {
+    var c configuration
+    if err := p.API.LoadPluginConfiguration(&c); err != nil {
+        return err
+    }
+    p.confPath = strings.TrimSpace(c.ConfigFilePath)
+    return nil
+}
+
 func (p *Plugin) OnActivate() error {
-	// Читаем путь к конфигу из настроек плагина
-	conf := p.API.GetConfig()
-	if conf == nil {
-		return errors.New("failed to get Mattermost config")
-	}
-	p.confPath = p.getConfigString("ConfigFilePath")
-	if p.confPath == "" {
-		return errors.New("ConfigFilePath is empty in plugin settings")
-	}
-	if err := p.ensureConfig(); err != nil {
-		return err
-	}
+    if err := p.OnConfigurationChange(); err != nil {
+        return err
+    }
+    if p.confPath == "" {
+        return errors.New("ConfigFilePath is empty in plugin settings")
+    }
+    if err := p.ensureConfig(); err != nil {
+        return err
+    }
 
 	p.httpc = &http.Client{Timeout: 120 * time.Second}
 
@@ -113,17 +124,6 @@ func (p *Plugin) registerCommand(trigger, help string) error {
 	return p.API.RegisterCommand(cmd)
 }
 
-func (p *Plugin) getConfigString(key string) string {
-	settings := p.API.GetPluginConfig()
-	if settings == nil {
-		return ""
-	}
-	if v, ok := settings[key].(string); ok {
-		return v
-	}
-	return ""
-}
-
 func (p *Plugin) ensureConfig() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -136,11 +136,13 @@ func (p *Plugin) ensureConfig() error {
 	if _, err := os.Stat(p.confPath); os.IsNotExist(err) {
 		now := time.Now().UTC()
 		def := &Config{
-			GenAPIEndpoint:      "https://api.gen-api.ru/v1/images", // провайдер настраивается
+			GenAPIEndpoint:      "https://api.gen-api.ru/api/v1/networks/", // провайдер настраивается
+			GenAPIGetEndpoint:   "https://api.gen-api.ru/api/v1/request/get/",
 			GenAPIToken:         "PUT_YOUR_TOKEN",
-			GenAPIModel:         "gpt-image-1",
-			PCloudAPIHost:       "https://api.pcloud.com",
-			PCloudToken:         "PUT_PCLOUD_TOKEN",
+			GenAPIModel:         "qwen-image",
+			PCloudAPIHost:       "https://eapi.pcloud.com",
+			PCloudUsername: 	 "PUT_PCLOUD_USERNAME",
+	        PCloudPassword:     "PUT_PCLOUD_PASSWORD",
 			PCloudFolderID:      0,
 			DefaultMonthlyQuota: 20,
 			NextReset:           now.AddDate(0, 1, 0),
@@ -200,6 +202,24 @@ func (p *Plugin) logf(format string, args ...any) {
 	}
 }
 
+func (p *Plugin) riskyLogf(format string, args ...any) {
+	msg := fmt.Sprintf(time.Now().Format(time.RFC3339)+" "+format+"\n", args...)
+	p.API.LogInfo(msg)
+	logPath := ""
+	if p.cfg != nil {
+		logPath = p.cfg.LogPath
+	}
+	if logPath == "" {
+		return
+	}
+	_ = os.MkdirAll(filepath.Dir(logPath), 0o755)
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err == nil {
+		defer f.Close()
+		_, _ = f.WriteString(msg)
+	}
+}
+
 func (p *Plugin) ExecuteCommand(c *plugin.Context, args *model.CommandArgs) (*model.CommandResponse, *model.AppError) {
 	trigger := strings.TrimPrefix(strings.SplitN(args.Command, " ", 2)[0], "/")
 	text := strings.TrimSpace(strings.TrimPrefix(args.Command, "/"+trigger))
@@ -228,7 +248,7 @@ func (p *Plugin) ExecuteCommand(c *plugin.Context, args *model.CommandArgs) (*mo
 
 func (p *Plugin) handleGenerate(args *model.CommandArgs, prompt string, quality string) (*model.CommandResponse, *model.AppError) {
 	if strings.TrimSpace(prompt) == "" {
-		return resp("Нужно указать промпт: `/"+strings.ReplaceAll(args.Command, "/"+quality, quality)+" <prompt>`"), nil
+		return resp("Нужно указать промпт: `/"+strings.ReplaceAll(args.Command, "/"+quality, quality)+" <prompt>`", args.ChannelId), nil
 	}
 	// Обновить/сбросить квоты
 	if err := p.withConfig(func(cfg *Config) error {
@@ -239,7 +259,7 @@ func (p *Plugin) handleGenerate(args *model.CommandArgs, prompt string, quality 
 				u.BonusThisPeriod = 0
 			}
 			cfg.NextReset = cfg.NextReset.AddDate(0, 1, 0)
-			p.logf("quota reset executed; next=%s", cfg.NextReset.Format(time.RFC3339))
+			p.riskyLogf("quota reset executed; next=%s", cfg.NextReset.Format(time.RFC3339))
 		}
 		// Авто-регистрация пользователя, если не найден
 		u := cfg.Users[args.UserId]
@@ -263,24 +283,25 @@ func (p *Plugin) handleGenerate(args *model.CommandArgs, prompt string, quality 
 		}
 		return nil
 	}); err != nil {
+		p.logf("Err occured: %#v", err)
 		if qe, ok := err.(*quotaError); ok {
-			return resp(qe.msg), nil
+			return resp(qe.msg, args.ChannelId), nil
 		}
-		return resp("Ошибка квоты: "+err.Error()), nil
+		return resp("Ошибка квоты: "+err.Error(), args.ChannelId), nil
 	}
 
 	// Генерация
 	imgBytes, genInfo, err := p.generateImage(context.Background(), prompt, quality)
 	if err != nil {
 		p.logf("ERR generate: %v", err)
-		return resp("Не удалось сгенерировать изображение: " + err.Error()), nil
+		return resp("Не удалось сгенерировать изображение: " + err.Error(), args.ChannelId), nil
 	}
 
 	// Загрузка в pCloud
 	pubURL, err := p.uploadToPCloudAndGetPublicURL(imgBytes)
 	if err != nil {
 		p.logf("ERR pcloud: %v", err)
-		return resp("Сгенерировал, но не смог опубликовать в pCloud: " + err.Error()), nil
+		return resp("Сгенерировал, но не смог опубликовать в pCloud: " + err.Error(), args.ChannelId), nil
 	}
 
 	// Списать квоту
@@ -293,7 +314,7 @@ func (p *Plugin) handleGenerate(args *model.CommandArgs, prompt string, quality 
 	})
 
 	p.logf("OK gen -> %s (quality=%s size=%dB info=%s)", pubURL, quality, len(imgBytes), genInfo)
-	return resp(pubURL), nil
+	return resp(pubURL, args.ChannelId), nil
 }
 
 type quotaError struct{ msg string }
@@ -302,15 +323,15 @@ func (e *quotaError) Error() string { return e.msg }
 func (p *Plugin) handleAddUser(args *model.CommandArgs, text string) (*model.CommandResponse, *model.AppError) {
 	parts := fields(text)
 	if len(parts) != 1 {
-		return resp("Синтаксис: /add_user <username>"), nil
+		return resp("Синтаксис: /add_user <username>", args.ChannelId), nil
 	}
 	if !p.isAdmin(args.UserId) {
-		return resp("Доступ только для администратора."), nil
+		return resp("Доступ только для администратора.", args.ChannelId), nil
 	}
 	username := strings.TrimSpace(parts[0])
 	mmUser, appErr := p.API.GetUserByUsername(username)
 	if appErr != nil {
-		return resp("Пользователь не найден в Mattermost: " + username), nil
+		return resp("Пользователь не найден в Mattermost: " + username, args.ChannelId), nil
 	}
 	err := p.withConfig(func(cfg *Config) error {
 		if _, exists := cfg.Users[mmUser.Id]; exists {
@@ -327,25 +348,25 @@ func (p *Plugin) handleAddUser(args *model.CommandArgs, text string) (*model.Com
 		return nil
 	})
 	if err != nil {
-		return resp("Ошибка: " + err.Error()), nil
+		return resp("Ошибка: " + err.Error(), args.ChannelId), nil
 	}
-	return resp("Добавлен: " + username), nil
+	return resp("Добавлен: " + username, args.ChannelId), nil
 }
 
 func (p *Plugin) handleGiveGen(args *model.CommandArgs, text string) (*model.CommandResponse, *model.AppError) {
 	if !p.isAdmin(args.UserId) {
-		return resp("Доступ только для администратора."), nil
+		return resp("Доступ только для администратора.", args.ChannelId), nil
 	}
 	parts := fields(text)
 	if len(parts) != 2 {
-		return resp("Синтаксис: /give_gen <username|id> <amount>"), nil
+		return resp("Синтаксис: /give_gen <username|id> <amount>", args.ChannelId), nil
 	}
 	target := parts[0]
 	amt, err := strconv.Atoi(parts[1])
 	if err != nil || amt <= 0 {
-		return resp("amount должен быть положительным числом"), nil
+		return resp("amount должен быть положительным числом", args.ChannelId), nil
 	}
-	return p.findUserAndDo(target, func(u *User) error {
+	return p.findUserAndDo(args.ChannelId, target, func(u *User) error {
 		u.BonusThisPeriod += amt
 		return nil
 	}, fmt.Sprintf("Выдано +%d генераций пользователю ", amt))
@@ -364,12 +385,12 @@ func (p *Plugin) handleMyQuota(args *model.CommandArgs) (*model.CommandResponse,
 			u.Remaining(), u.UsedThisPeriod, u.MaxPerMonth, u.BonusThisPeriod, cfg.NextReset.Format("2006-01-02 15:04"))
 		return nil
 	})
-	return resp(msg), nil
+	return resp(msg, args.ChannelId), nil
 }
 
 func (p *Plugin) handleListUsers(args *model.CommandArgs) (*model.CommandResponse, *model.AppError) {
 	if !p.isAdmin(args.UserId) {
-		return resp("Доступ только для администратора."), nil
+		return resp("Доступ только для администратора.", args.ChannelId), nil
 	}
 	var b strings.Builder
 	_ = p.withConfig(func(cfg *Config) error {
@@ -384,19 +405,19 @@ func (p *Plugin) handleListUsers(args *model.CommandArgs) (*model.CommandRespons
 		}
 		return nil
 	})
-	return resp(b.String()), nil
+	return resp(b.String(), args.ChannelId), nil
 }
 
 func (p *Plugin) handleRemoveUser(args *model.CommandArgs, text string) (*model.CommandResponse, *model.AppError) {
 	if !p.isAdmin(args.UserId) {
-		return resp("Доступ только для администратора."), nil
+		return resp("Доступ только для администратора.", args.ChannelId), nil
 	}
 	parts := fields(text)
 	if len(parts) != 1 {
-		return resp("Синтаксис: /remove_user <username|id>"), nil
+		return resp("Синтаксис: /remove_user <username|id>", args.ChannelId), nil
 	}
 	target := parts[0]
-	return p.findUserAndDo(target, func(u *User) error {
+	return p.findUserAndDo(args.ChannelId, target, func(u *User) error {
 		return p.withConfig(func(cfg *Config) error {
 			delete(cfg.Users, u.UserID)
 			return nil
@@ -406,7 +427,7 @@ func (p *Plugin) handleRemoveUser(args *model.CommandArgs, text string) (*model.
 
 func (p *Plugin) handleShowLog(args *model.CommandArgs, text string) (*model.CommandResponse, *model.AppError) {
 	if !p.isAdmin(args.UserId) {
-		return resp("Доступ только для администратора."), nil
+		return resp("Доступ только для администратора.", args.ChannelId), nil
 	}
 	n := 100
 	if t := strings.TrimSpace(text); t != "" {
@@ -419,9 +440,9 @@ func (p *Plugin) handleShowLog(args *model.CommandArgs, text string) (*model.Com
 	p.mu.RUnlock()
 	lines, err := tailLastLines(lp, n)
 	if err != nil {
-		return resp("Ошибка чтения лога: " + err.Error()), nil
+		return resp("Ошибка чтения лога: " + err.Error(), args.ChannelId), nil
 	}
-	return resp("```\n" + strings.Join(lines, "\n") + "\n```"), nil
+	return resp("```\n" + strings.Join(lines, "\n") + "\n```", args.ChannelId), nil
 }
 
 func (p *Plugin) isAdmin(userID string) bool {
@@ -435,7 +456,7 @@ func (p *Plugin) isAdmin(userID string) bool {
 	return ok
 }
 
-func (p *Plugin) findUserAndDo(target string, fn func(*User) error, okPrefix string) (*model.CommandResponse, *model.AppError) {
+func (p *Plugin) findUserAndDo(cid string, target string, fn func(*User) error, okPrefix string) (*model.CommandResponse, *model.AppError) {
 	var out string
 	err := p.withConfig(func(cfg *Config) error {
 		// по id?
@@ -459,9 +480,9 @@ func (p *Plugin) findUserAndDo(target string, fn func(*User) error, okPrefix str
 		return fmt.Errorf("пользователь не найден")
 	})
 	if err != nil {
-		return resp("Ошибка: " + err.Error()), nil
+		return resp("Ошибка: " + err.Error(), cid), nil
 	}
-	return resp(out), nil
+	return resp(out, cid), nil
 }
 
 func (p *Plugin) withConfig(edit func(*Config) error) error {
@@ -512,48 +533,79 @@ func fields(s string) []string {
 	return out
 }
 
-func resp(text string) *model.CommandResponse {
+func resp(text string, cid string) *model.CommandResponse {
 	return &model.CommandResponse{
-		ResponseType: model.CommandResponseTypeEphemeral,
+		ResponseType: model.CommandResponseTypeInChannel,
 		Text:         text,
+		ChannelId:    cid,
 	}
 }
 
-// ============ Генерация через GenAPI (абстрактно, т.к. у GenAPI детали после логина) ============
+// ============ Генерация через GenAPI ============
 type genAPIResponse struct {
-	// OpenAI-like
-	Data []struct {
-		B64 string `json:"b64_json"`
-		URL string `json:"url"`
-	} `json:"data"`
-	// or custom wrapper
-	ImageB64 string `json:"image_b64"`
-	Error    string `json:"error"`
+	RID 	 int64 `json:"request_id"`
+	Status   string `json:"status"`
+}
+
+type genAPIResult struct {
+	Result 	 []string `json:"result"`
+	Status   string `json:"status"`
+}
+
+func (p *Plugin) requestImage(ctx context.Context, resId int64, token string, getUrl string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, getUrl+fmt.Sprintf("%d", resId), nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := p.httpc.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var g genAPIResult
+	if err := json.NewDecoder(resp.Body).Decode(&g); err != nil {
+		return "", err
+	}
+
+	if g.Status != "success" {
+		return "", errors.New(g.Status)
+	}
+
+	return g.Result[0], nil
 }
 
 func (p *Plugin) generateImage(ctx context.Context, prompt string, quality string) ([]byte, string, error) {
 	p.mu.RLock()
 	endpoint := p.cfg.GenAPIEndpoint
+	getUrl := p.cfg.GenAPIGetEndpoint
 	token := p.cfg.GenAPIToken
 	modelID := p.cfg.GenAPIModel
 	p.mu.RUnlock()
 
 	// маппинг качества -> "size"/"quality"
-	size := map[string]string{"low": "512x512", "medium": "1024x1024", "high": "2048x2048"}[quality]
-	if size == "" {
-		size = "1024x1024"
+	size, ok := map[string][2]int{"low": {512, 512}, "medium": {1024, 1024}, "high": {1536, 1536}}[quality]
+	if !ok {
+		size = [2]int{1024, 1024}
 	}
 
+	imageWidth := size[0]
+	imageHeight := size[1]
+
 	payload := map[string]any{
-		"model":  modelID,
-		"prompt": prompt,
-		"size":   size,
-		"n":      1,
-		"quality": quality, // если у провайдера есть этот параметр — пусть передастся
+		"prompt": 					prompt,
+		"width":  					imageWidth,
+		"height": 					imageHeight,
+		"num_images":				1,
+		"enable_safety_checker": 	false,
+		"negative_prompt":			"-",
 	}
 	body, _ := json.Marshal(payload)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint+modelID, bytes.NewReader(body))
 	if err != nil {
 		return nil, "", err
 	}
@@ -569,32 +621,36 @@ func (p *Plugin) generateImage(ctx context.Context, prompt string, quality strin
 		b, _ := io.ReadAll(resp.Body)
 		return nil, "", fmt.Errorf("gen-api http %d: %s", resp.StatusCode, string(b))
 	}
+
 	var g genAPIResponse
 	if err := json.NewDecoder(resp.Body).Decode(&g); err != nil {
 		return nil, "", err
 	}
-	if g.Error != "" {
-		return nil, "", errors.New(g.Error)
+
+	const (
+        maxAttempts    = 20
+        pollInterval   = 2 * time.Second
+    )
+
+	var imUrl string
+    for i := 0; i < maxAttempts; i++ {
+        select {
+        case <-ctx.Done():
+            return nil, "", ctx.Err()
+        case <-time.After(pollInterval):
+        }
+
+        imUrl, err = p.requestImage(ctx, g.RID, token, getUrl)
+		if err == nil {
+			break
+		}
 	}
 
-	// приоритет: b64
-	if len(g.Data) > 0 && g.Data[0].B64 != "" {
-		img, err := base64.StdEncoding.DecodeString(g.Data[0].B64)
-		return img, "b64", err
-	}
-	if g.ImageB64 != "" {
-		img, err := base64.StdEncoding.DecodeString(g.ImageB64)
-		return img, "b64", err
-	}
 	// если отдают URL — стянем
-	var url string
-	if len(g.Data) > 0 && g.Data[0].URL != "" {
-		url = g.Data[0].URL
-	}
-	if url == "" {
+	if imUrl == "" {
 		return nil, "", errors.New("gen-api: empty image")
 	}
-	r2, err := p.httpc.Get(url)
+	r2, err := p.httpc.Get(imUrl)
 	if err != nil {
 		return nil, "", err
 	}
@@ -608,6 +664,12 @@ func (p *Plugin) generateImage(ctx context.Context, prompt string, quality strin
 }
 
 // ============ pCloud ============
+type pcloudTokenResp struct {
+	Token 	 string `json:"auth"`
+	Result   int `json:"result"`
+	Error 	 string `json:"error"`
+}
+
 type pcloudUploadResp struct {
 	Result   int `json:"result"`
 	Metadata []struct {
@@ -627,25 +689,29 @@ type pcloudPublinkResp struct {
 func (p *Plugin) uploadToPCloudAndGetPublicURL(img []byte) (string, error) {
 	p.mu.RLock()
 	host := p.cfg.PCloudAPIHost
-	token := p.cfg.PCloudToken
+	username := p.cfg.PCloudUsername
+	password := p.cfg.PCloudPassword
 	fid := p.cfg.PCloudFolderID
 	p.mu.RUnlock()
 
-	// 1) uploadfile
-	var buf bytes.Buffer
-	w := multipart.NewWriter(&buf)
-	_ = w.WriteField("access_token", token)
-	_ = w.WriteField("folderid", fmt.Sprintf("%d", fid))
-	_ = w.WriteField("renameifexists", "1")
-	fw, _ := w.CreateFormFile("file", fmt.Sprintf("image-%d.png", time.Now().Unix()))
-	_, _ = fw.Write(img)
-	_ = w.Close()
+	// 0) gettoken
 
-	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(host, "/")+"/uploadfile", &buf)
+	base, _ := url.Parse(strings.TrimRight(host, "/")+"/userinfo")
+
+	// Query parameters
+	params := url.Values{}
+	params.Set("getauth", "1")
+	params.Set("logout", "1")
+	params.Set("username", username)
+	params.Set("password", password)
+
+	// This encodes all special chars (+, @, &, spaces, etc.)
+	base.RawQuery = params.Encode()
+
+	req, err := http.NewRequest(http.MethodGet, base.String(), nil)
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Content-Type", w.FormDataContentType())
 
 	resp, err := p.httpc.Do(req)
 	if err != nil {
@@ -654,10 +720,47 @@ func (p *Plugin) uploadToPCloudAndGetPublicURL(img []byte) (string, error) {
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("pcloud upload http %d: %s", resp.StatusCode, string(b))
+		return "", fmt.Errorf("pcloud get token http %d: %s", resp.StatusCode, string(b))
+	}
+
+	var ptr pcloudTokenResp
+	if err := json.NewDecoder(resp.Body).Decode(&ptr); err != nil {
+		return "", err
+	}
+
+	if ptr.Result != 0 {
+		return "", fmt.Errorf("pcloud auth error: %s (code=%d)", ptr.Error, ptr.Result)
+	}
+
+	token := ptr.Token
+
+	// 1) uploadfile
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	_ = w.WriteField("auth", token)
+	_ = w.WriteField("folderid", fmt.Sprintf("%d", fid))
+	_ = w.WriteField("renameifexists", "1")
+	fw, _ := w.CreateFormFile("file", fmt.Sprintf("image-%d.png", time.Now().Unix()))
+	_, _ = fw.Write(img)
+	_ = w.Close()
+
+	reqN, errN := http.NewRequest(http.MethodPost, strings.TrimRight(host, "/")+"/uploadfile", &buf)
+	if errN != nil {
+		return "", errN
+	}
+	reqN.Header.Set("Content-Type", w.FormDataContentType())
+
+	respN, errN := p.httpc.Do(reqN)
+	if errN != nil {
+		return "", errN
+	}
+	defer respN.Body.Close()
+	if respN.StatusCode >= 300 {
+		b, _ := io.ReadAll(respN.Body)
+		return "", fmt.Errorf("pcloud upload http %d: %s", respN.StatusCode, string(b))
 	}
 	var up pcloudUploadResp
-	if err := json.NewDecoder(resp.Body).Decode(&up); err != nil {
+	if err := json.NewDecoder(respN.Body).Decode(&up); err != nil {
 		return "", err
 	}
 	if up.Result != 0 || len(up.Metadata) == 0 {
@@ -666,7 +769,7 @@ func (p *Plugin) uploadToPCloudAndGetPublicURL(img []byte) (string, error) {
 	fileID := up.Metadata[0].FileID
 
 	// 2) getfilepublink
-	u2 := fmt.Sprintf("%s/getfilepublink?access_token=%s&fileid=%d", strings.TrimRight(host, "/"), token, fileID)
+	u2 := fmt.Sprintf("%s/getfilepublink?auth=%s&fileid=%d", strings.TrimRight(host, "/"), token, fileID)
 	r2, err := p.httpc.Get(u2)
 	if err != nil {
 		return "", err
