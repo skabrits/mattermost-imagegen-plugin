@@ -369,7 +369,7 @@ func (p *Plugin) handleGiveGen(args *model.CommandArgs, text string) (*model.Com
 	if err != nil || amt < 0 {
 		return resp("amount должен быть неотрицательным числом", args.ChannelId), nil
 	}
-	return p.findUserAndDo(args.ChannelId, target, func(u *User) error {
+	return p.findUserAndDo(args.ChannelId, target, func(u *User, cfg *Config) error {
 		u.BonusThisPeriod = amt
 		return nil
 	}, fmt.Sprintf("Выдано %d генераций пользователю ", amt))
@@ -420,11 +420,9 @@ func (p *Plugin) handleRemoveUser(args *model.CommandArgs, text string) (*model.
 		return resp("Синтаксис: /remove_user <username|id>", args.ChannelId), nil
 	}
 	target := parts[0]
-	return p.findUserAndDo(args.ChannelId, target, func(u *User) error {
-		return p.withConfig(func(cfg *Config) error {
-			delete(cfg.Users, u.UserID)
-			return nil
-		})
+	return p.findUserAndDo(args.ChannelId, target, func(u *User, cfg *Config) error {
+		delete(cfg.Users, u.UserID)
+		return nil
 	}, "Удалён пользователь ")
 }
 
@@ -459,12 +457,12 @@ func (p *Plugin) isAdmin(userID string) bool {
 	return ok
 }
 
-func (p *Plugin) findUserAndDo(cid string, target string, fn func(*User) error, okPrefix string) (*model.CommandResponse, *model.AppError) {
+func (p *Plugin) findUserAndDo(cid string, target string, fn func(*User, *Config) error, okPrefix string) (*model.CommandResponse, *model.AppError) {
 	var out string
 	err := p.withConfig(func(cfg *Config) error {
 		// по id?
 		if u := cfg.Users[target]; u != nil {
-			if err := fn(u); err != nil {
+			if err := fn(u, cfg); err != nil {
 				return err
 			}
 			out = okPrefix + u.Username
@@ -473,7 +471,7 @@ func (p *Plugin) findUserAndDo(cid string, target string, fn func(*User) error, 
 		// по username
 		for _, u := range cfg.Users {
 			if u.Username == target {
-				if err := fn(u); err != nil {
+				if err := fn(u, cfg); err != nil {
 					return err
 				}
 				out = okPrefix + u.Username
