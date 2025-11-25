@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"regexp"
 	"sync"
 	"time"
 	"net/url"
@@ -256,9 +257,11 @@ func (p *Plugin) handleGenerate(args *model.CommandArgs, prompt string, quality 
 		if now.After(cfg.NextReset) || now.Equal(cfg.NextReset) {
 			for _, u := range cfg.Users {
 				u.UsedThisPeriod = 0
-				u.BonusThisPeriod = 0
+				// u.BonusThisPeriod = 0
 			}
-			cfg.NextReset = cfg.NextReset.AddDate(0, 1, 0)
+			for !cfg.NextReset.After(now) {
+				cfg.NextReset = cfg.NextReset.AddDate(0, 1, 0)
+			}
 			p.riskyLogf("quota reset executed; next=%s", cfg.NextReset.Format(time.RFC3339))
 		}
 		// Авто-регистрация пользователя, если не найден
@@ -297,13 +300,6 @@ func (p *Plugin) handleGenerate(args *model.CommandArgs, prompt string, quality 
 		return resp("Не удалось сгенерировать изображение: " + err.Error(), args.ChannelId), nil
 	}
 
-	// Загрузка в pCloud
-	pubURL, err := p.uploadToPCloudAndGetPublicURL(imgBytes)
-	if err != nil {
-		p.logf("ERR pcloud: %v", err)
-		return resp("Сгенерировал, но не смог опубликовать в pCloud: " + err.Error(), args.ChannelId), nil
-	}
-
 	// Списать квоту
 	_ = p.withConfig(func(cfg *Config) error {
 		u := cfg.Users[args.UserId]
@@ -312,6 +308,13 @@ func (p *Plugin) handleGenerate(args *model.CommandArgs, prompt string, quality 
 		u.LastGeneration = &now
 		return nil
 	})
+
+	// Загрузка в pCloud
+	pubURL, err := p.uploadToPCloudAndGetPublicURL(imgBytes)
+	if err != nil {
+		p.logf("ERR pcloud: %v", err)
+		return resp("Сгенерировал, но не смог опубликовать в pCloud: " + err.Error(), args.ChannelId), nil
+	}
 
 	p.logf("OK gen -> %s (quality=%s size=%dB info=%s)", pubURL, quality, len(imgBytes), genInfo)
 	return resp(pubURL, args.ChannelId), nil
@@ -363,13 +366,13 @@ func (p *Plugin) handleGiveGen(args *model.CommandArgs, text string) (*model.Com
 	}
 	target := parts[0]
 	amt, err := strconv.Atoi(parts[1])
-	if err != nil || amt <= 0 {
-		return resp("amount должен быть положительным числом", args.ChannelId), nil
+	if err != nil || amt < 0 {
+		return resp("amount должен быть неотрицательным числом", args.ChannelId), nil
 	}
 	return p.findUserAndDo(args.ChannelId, target, func(u *User) error {
-		u.BonusThisPeriod += amt
+		u.BonusThisPeriod = amt
 		return nil
-	}, fmt.Sprintf("Выдано +%d генераций пользователю ", amt))
+	}, fmt.Sprintf("Выдано %d генераций пользователю ", amt))
 }
 
 func (p *Plugin) handleMyQuota(args *model.CommandArgs) (*model.CommandResponse, *model.AppError) {
@@ -586,23 +589,43 @@ func (p *Plugin) generateImage(ctx context.Context, prompt string, quality strin
 	modelID := p.cfg.GenAPIModel
 	p.mu.RUnlock()
 
-	// маппинг качества -> "size"/"quality"
-	size, ok := map[string][2]int{"low": {512, 512}, "medium": {1024, 1024}, "high": {1536, 1536}}[quality]
-	if !ok {
-		size = [2]int{1024, 1024}
+	var payload map[string]any
+	if modelID == "qwen-image" {
+		// маппинг качества -> "size"/"quality"
+		size, ok := map[string][2]int{"low": {512, 512}, "medium": {1024, 1024}, "high": {1536, 1536}}[quality]
+		if !ok {
+			size = [2]int{1024, 1024}
+		}
+
+		imageWidth := size[0]
+		imageHeight := size[1]
+
+		payload = map[string]any{
+			"prompt": 					prompt,
+			"width":  					imageWidth,
+			"height": 					imageHeight,
+			"num_images":				1,
+			"enable_safety_checker": 	false,
+			"negative_prompt":			"-",
+		}
+	} else if modelID == "gpt-image-1" {
+		payload = map[string]any{
+			"prompt": 		prompt,
+			"quality":  	quality,
+			"is_sync":		false,
+		}
+	} else {
+		payload = map[string]any{
+			"prompt": 		prompt,
+			"quality":  	quality,
+			"is_sync":		false,
+			"model": 		modelID,
+		}
+
+		modelID = "gpt-image-1"
 	}
 
-	imageWidth := size[0]
-	imageHeight := size[1]
 
-	payload := map[string]any{
-		"prompt": 					prompt,
-		"width":  					imageWidth,
-		"height": 					imageHeight,
-		"num_images":				1,
-		"enable_safety_checker": 	false,
-		"negative_prompt":			"-",
-	}
 	body, _ := json.Marshal(payload)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint+modelID, bytes.NewReader(body))
@@ -710,22 +733,25 @@ func (p *Plugin) uploadToPCloudAndGetPublicURL(img []byte) (string, error) {
 
 	req, err := http.NewRequest(http.MethodGet, base.String(), nil)
 	if err != nil {
-		return "", err
+		safe := sanitizePCloudError(err)
+		return "", fmt.Errorf("pcloud http error: %s", safe)
 	}
 
 	resp, err := p.httpc.Do(req)
 	if err != nil {
-		return "", err
+		safe := sanitizePCloudError(err)
+		return "", fmt.Errorf("pcloud http error: %s", safe)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("pcloud get token http %d: %s", resp.StatusCode, string(b))
+		return "", fmt.Errorf("pcloud get token http %d: %s", resp.StatusCode, sanitizePCloudPayload(string(b)))
 	}
 
 	var ptr pcloudTokenResp
 	if err := json.NewDecoder(resp.Body).Decode(&ptr); err != nil {
-		return "", err
+		safe := sanitizePCloudError(err)
+		return "", fmt.Errorf("pcloud decode error: %s", safe)
 	}
 
 	if ptr.Result != 0 {
@@ -746,22 +772,25 @@ func (p *Plugin) uploadToPCloudAndGetPublicURL(img []byte) (string, error) {
 
 	reqN, errN := http.NewRequest(http.MethodPost, strings.TrimRight(host, "/")+"/uploadfile", &buf)
 	if errN != nil {
-		return "", errN
+		safe := sanitizePCloudError(errN)
+		return "", fmt.Errorf("pcloud http error: %s", safe)
 	}
 	reqN.Header.Set("Content-Type", w.FormDataContentType())
 
 	respN, errN := p.httpc.Do(reqN)
 	if errN != nil {
-		return "", errN
+		safe := sanitizePCloudError(errN)
+		return "", fmt.Errorf("pcloud http error: %s", safe)
 	}
 	defer respN.Body.Close()
 	if respN.StatusCode >= 300 {
 		b, _ := io.ReadAll(respN.Body)
-		return "", fmt.Errorf("pcloud upload http %d: %s", respN.StatusCode, string(b))
+		return "", fmt.Errorf("pcloud upload http %d: %s", respN.StatusCode, sanitizePCloudPayload(string(b)))
 	}
 	var up pcloudUploadResp
 	if err := json.NewDecoder(respN.Body).Decode(&up); err != nil {
-		return "", err
+		safe := sanitizePCloudError(err)
+		return "", fmt.Errorf("pcloud decode error: %s", safe)
 	}
 	if up.Result != 0 || len(up.Metadata) == 0 {
 		return "", fmt.Errorf("pcloud upload error: %s (code=%d)", up.Error, up.Result)
@@ -772,18 +801,72 @@ func (p *Plugin) uploadToPCloudAndGetPublicURL(img []byte) (string, error) {
 	u2 := fmt.Sprintf("%s/getfilepublink?auth=%s&fileid=%d", strings.TrimRight(host, "/"), token, fileID)
 	r2, err := p.httpc.Get(u2)
 	if err != nil {
-		return "", err
+		safe := sanitizePCloudError(err)
+		return "", fmt.Errorf("pcloud http error: %s", safe)
 	}
 	defer r2.Body.Close()
 	var pl pcloudPublinkResp
 	if err := json.NewDecoder(r2.Body).Decode(&pl); err != nil {
-		return "", err
+		safe := sanitizePCloudError(err)
+		return "", fmt.Errorf("pcloud decode error: %s", safe)
 	}
 	if pl.Result != 0 || pl.Link == "" {
 		return "", fmt.Errorf("pcloud publink error: %s (code=%d)", pl.Error, pl.Result)
 	}
 	// pl.Link — это страница, у которой внутри есть прямой dl; для простоты вернём pl.Link
 	return pl.Link, nil
+}
+
+var (
+	rePass = regexp.MustCompile(`password=[^&"\s]+`)
+	reUser = regexp.MustCompile(`username=[^&"\s]+`)
+	reToken = regexp.MustCompile(`auth=[^&"\s]+`)
+)
+
+// sanitizePCloudError делает текст ошибки безопасным для логов/юзера
+func sanitizePCloudError(err error) string {
+	if err == nil {
+		return ""
+	}
+
+	// 1) Аккуратно обрабатываем url.Error, чтобы выпилить креды из URL
+	var uerr *url.Error
+	if errors.As(err, &uerr) {
+		if parsed, perr := url.Parse(uerr.URL); perr == nil {
+			q := parsed.Query()
+			if q.Has("password") {
+				q.Set("password", "***")
+			}
+			if q.Has("username") {
+				q.Set("username", "***")
+			}
+			if q.Has("auth") {
+				q.Set("auth", "***")
+			}
+			parsed.RawQuery = q.Encode()
+
+			return fmt.Sprintf("%s %s: %v", uerr.Op, parsed.String(), uerr.Err)
+		}
+	}
+
+	// 2) Fallback — просто выпиливаем креды из строки
+	s := err.Error()
+	s = rePass.ReplaceAllString(s, "password=***")
+	s = reUser.ReplaceAllString(s, "username=***")
+	s = reToken.ReplaceAllString(s, "auth=***")
+	return s
+}
+
+func sanitizePCloudPayload(pl string) string {
+	if pl == "" {
+		return ""
+	}
+
+	s := pl
+	s = rePass.ReplaceAllString(s, "password=***")
+	s = reUser.ReplaceAllString(s, "username=***")
+	s = reToken.ReplaceAllString(s, "auth=***")
+	return s
 }
 
 // ===== утилита tail =====

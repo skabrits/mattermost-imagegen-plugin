@@ -1,0 +1,1 @@
+cat extract_artifact.ps1 | tr -d '\r' | bash

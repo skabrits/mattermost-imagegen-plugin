@@ -2,7 +2,7 @@
   "gen_api_endpoint": "https://api.gen-api.ru/api/v1/networks/", 
   "gen_api_get_endpoint": "https://api.gen-api.ru/api/v1/request/get/",
   "gen_api_token": "YOUR_GENAPI_TOKEN",
-  "gen_api_model": "qwen-image",
+  "gen_api_model": "gpt-image-1",
   "pcloud_api_host": "https://eapi.pcloud.com",
   "pcloud_user": "YOUR_PCLOUD_USER",
   "pcloud_password": "YOUR_PCLOUD_PASSWORD",
