@@ -44,6 +44,7 @@ type Config struct {
 	PCloudAPIHost    string `json:"pcloud_api_host"`    // "https://api.pcloud.com"
 	PCloudUsername string `json:"pcloud_user"`
 	PCloudPassword string `json:"pcloud_password"`
+	PCloudBearerToken string `json:"pcloud_bearer_token"`
 	PCloudFolderID   int64  `json:"pcloud_folder_id"`   // куда грузим изображения
 	// Квоты/лог
 	DefaultMonthlyQuota int       `json:"default_monthly_quota"`
@@ -144,6 +145,7 @@ func (p *Plugin) ensureConfig() error {
 			PCloudAPIHost:       "https://eapi.pcloud.com",
 			PCloudUsername: 	 "PUT_PCLOUD_USERNAME",
 	        PCloudPassword:     "PUT_PCLOUD_PASSWORD",
+			PCloudBearerToken:  "PUT_PCLOUD_BEARER_TOKEN",
 			PCloudFolderID:      0,
 			DefaultMonthlyQuota: 20,
 			NextReset:           now.AddDate(0, 1, 0),
@@ -730,56 +732,68 @@ func (p *Plugin) uploadToPCloudAndGetPublicURL(img []byte) (string, error) {
 	host := p.cfg.PCloudAPIHost
 	username := p.cfg.PCloudUsername
 	password := p.cfg.PCloudPassword
+	btoken := p.cfg.PCloudBearerToken
+	has_btoken := btoken != "" && btoken != "PUT_PCLOUD_BEARER_TOKEN" && btoken != "YOUR_PCLOUD_BEARER_TOKEN"
 	fid := p.cfg.PCloudFolderID
 	p.mu.RUnlock()
 
-	// 0) gettoken
+	var token string
 
-	base, _ := url.Parse(strings.TrimRight(host, "/")+"/userinfo")
+	if !has_btoken {
 
-	// Query parameters
-	params := url.Values{}
-	params.Set("getauth", "1")
-	params.Set("logout", "1")
-	params.Set("username", username)
-	params.Set("password", password)
+		// 0) gettoken
 
-	// This encodes all special chars (+, @, &, spaces, etc.)
-	base.RawQuery = params.Encode()
+		base, _ := url.Parse(strings.TrimRight(host, "/")+"/userinfo")
 
-	req, err := http.NewRequest(http.MethodGet, base.String(), nil)
-	if err != nil {
-		safe := sanitizePCloudError(err)
-		return "", fmt.Errorf("pcloud http error: %s", safe)
+		// Query parameters
+		params := url.Values{}
+		params.Set("getauth", "1")
+		params.Set("logout", "1")
+		params.Set("username", username)
+		params.Set("password", password)
+
+		// This encodes all special chars (+, @, &, spaces, etc.)
+		base.RawQuery = params.Encode()
+
+		req, err := http.NewRequest(http.MethodGet, base.String(), nil)
+		if err != nil {
+			safe := sanitizePCloudError(err)
+			return "", fmt.Errorf("pcloud http error: %s", safe)
+		}
+
+		resp, err := p.httpc.Do(req)
+		if err != nil {
+			safe := sanitizePCloudError(err)
+			return "", fmt.Errorf("pcloud http error: %s", safe)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode >= 300 {
+			b, _ := io.ReadAll(resp.Body)
+			return "", fmt.Errorf("pcloud get token http %d: %s", resp.StatusCode, sanitizePCloudPayload(string(b)))
+		}
+
+		var ptr pcloudTokenResp
+		if err := json.NewDecoder(resp.Body).Decode(&ptr); err != nil {
+			safe := sanitizePCloudError(err)
+			return "", fmt.Errorf("pcloud decode error: %s", safe)
+		}
+
+		if ptr.Result != 0 {
+			return "", fmt.Errorf("pcloud auth error: %s (code=%d)", ptr.Error, ptr.Result)
+		}
+
+		token = ptr.Token
+
+	} else {
+		token = "0"
 	}
-
-	resp, err := p.httpc.Do(req)
-	if err != nil {
-		safe := sanitizePCloudError(err)
-		return "", fmt.Errorf("pcloud http error: %s", safe)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("pcloud get token http %d: %s", resp.StatusCode, sanitizePCloudPayload(string(b)))
-	}
-
-	var ptr pcloudTokenResp
-	if err := json.NewDecoder(resp.Body).Decode(&ptr); err != nil {
-		safe := sanitizePCloudError(err)
-		return "", fmt.Errorf("pcloud decode error: %s", safe)
-	}
-
-	if ptr.Result != 0 {
-		return "", fmt.Errorf("pcloud auth error: %s (code=%d)", ptr.Error, ptr.Result)
-	}
-
-	token := ptr.Token
 
 	// 1) uploadfile
 	var buf bytes.Buffer
 	w := multipart.NewWriter(&buf)
-	_ = w.WriteField("auth", token)
+	if !has_btoken {
+		_ = w.WriteField("auth", token)
+	}
 	_ = w.WriteField("folderid", fmt.Sprintf("%d", fid))
 	_ = w.WriteField("renameifexists", "1")
 	fw, _ := w.CreateFormFile("file", fmt.Sprintf("image-%d.png", time.Now().Unix()))
@@ -791,7 +805,11 @@ func (p *Plugin) uploadToPCloudAndGetPublicURL(img []byte) (string, error) {
 		safe := sanitizePCloudError(errN)
 		return "", fmt.Errorf("pcloud http error: %s", safe)
 	}
+
 	reqN.Header.Set("Content-Type", w.FormDataContentType())
+	if has_btoken {
+		reqN.Header.Set("Authorization", "Bearer "+btoken)
+	}
 
 	respN, errN := p.httpc.Do(reqN)
 	if errN != nil {
@@ -814,8 +832,23 @@ func (p *Plugin) uploadToPCloudAndGetPublicURL(img []byte) (string, error) {
 	fileID := up.Metadata[0].FileID
 
 	// 2) getfilepublink
-	u2 := fmt.Sprintf("%s/getfilepublink?auth=%s&fileid=%d", strings.TrimRight(host, "/"), token, fileID)
-	r2, err := p.httpc.Get(u2)
+	var u2 string
+	if !has_btoken {
+		u2 = fmt.Sprintf("%s/getfilepublink?auth=%s&fileid=%d", strings.TrimRight(host, "/"), token, fileID)
+	} else {
+		u2 = fmt.Sprintf("%s/getfilepublink?fileid=%d", strings.TrimRight(host, "/"), fileID)
+	}
+	req2, err := http.NewRequest(http.MethodGet, u2, nil)
+	if err != nil {
+		safe := sanitizePCloudError(err)
+		return "", fmt.Errorf("pcloud http error: %s", safe)
+	}
+
+	if has_btoken {
+		req2.Header.Set("Authorization", "Bearer "+btoken)
+	}
+
+	r2, err := p.httpc.Do(req2)
 	if err != nil {
 		safe := sanitizePCloudError(err)
 		return "", fmt.Errorf("pcloud http error: %s", safe)

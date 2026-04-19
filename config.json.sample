@@ -6,6 +6,7 @@
   "pcloud_api_host": "https://eapi.pcloud.com",
   "pcloud_user": "YOUR_PCLOUD_USER",
   "pcloud_password": "YOUR_PCLOUD_PASSWORD",
+  "pcloud_bearer_token": "YOUR_PCLOUD_BEARER_TOKEN",
   "pcloud_folder_id": 123456789,
   "default_monthly_quota": 30,
   "next_reset": "2025-11-01T00:00:00Z",

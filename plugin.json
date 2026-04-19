@@ -2,7 +2,7 @@
   "id": "com.example.imagegen",
   "name": "ImageGen for Mattermost",
   "description": "Slash-команды для генерации изображений (GenAPI) с загрузкой в pCloud и квотами.",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "min_server_version": "9.0.0",
   "server": {
     "executable": "server/dist/plugin-linux-amd64"
