@@ -249,7 +249,7 @@ func (p *Plugin) ExecuteCommand(c *plugin.Context, args *model.CommandArgs) (*mo
 
 func (p *Plugin) handleGenerate(args *model.CommandArgs, prompt string, quality string) (*model.CommandResponse, *model.AppError) {
 	if strings.TrimSpace(prompt) == "" {
-		return resp("Нужно указать промпт: `/"+strings.ReplaceAll(args.Command, "/"+quality, quality)+" <prompt>`", args.ChannelId), nil
+		return resp("Нужно указать промпт: `/image"+quality+" <prompt>`", args.ChannelId), nil
 	}
 	// Обновить/сбросить квоты
 	if err := p.withConfig(func(cfg *Config) error {
@@ -293,21 +293,39 @@ func (p *Plugin) handleGenerate(args *model.CommandArgs, prompt string, quality 
 		return resp("Ошибка квоты: "+err.Error(), args.ChannelId), nil
 	}
 
-	// Генерация
-	imgBytes, genInfo, err := p.generateImage(context.Background(), prompt, quality)
-	if err != nil {
-		p.logf("ERR generate: %v", err)
-		return resp("Не удалось сгенерировать изображение: " + err.Error(), args.ChannelId), nil
-	}
+	var lastGen *time.Time
 
 	// Списать квоту
 	_ = p.withConfig(func(cfg *Config) error {
 		u := cfg.Users[args.UserId]
+		if u == nil {
+			return fmt.Errorf("Пользователь был удалён")
+		}
 		now := time.Now().UTC()
 		u.UsedThisPeriod++
+		lastGen = u.LastGeneration
 		u.LastGeneration = &now
 		return nil
 	})
+
+	// Генерация
+	imgBytes, genInfo, err := p.generateImage(context.Background(), prompt, quality)
+	if err != nil {
+		p.logf("ERR generate: %v", err)
+
+		// Вернуть квоту
+		_ = p.withConfig(func(cfg *Config) error {
+			u := cfg.Users[args.UserId]
+			if u == nil {
+				return fmt.Errorf("Пользователь был удалён")
+			}
+			u.UsedThisPeriod--
+			u.LastGeneration = lastGen
+			return nil
+		})
+
+		return resp("Не удалось сгенерировать изображение: " + err.Error(), args.ChannelId), nil
+	}
 
 	// Загрузка в pCloud
 	pubURL, err := p.uploadToPCloudAndGetPublicURL(imgBytes)
